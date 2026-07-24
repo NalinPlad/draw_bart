@@ -1,17 +1,773 @@
 ---
-
+import bart from '../data/bart.json';
+const dataJson = JSON.stringify(bart);
 ---
 
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
 		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
-		<meta name="viewport" content="width=device-width" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
+		<title>Draw the BART from memory</title>
+		<link
+			rel="stylesheet"
+			href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+			integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+			crossorigin=""
+		/>
 	</head>
 	<body>
-		<h1>Astro</h1>
+		<main class="page">
+			<h1 class="pagetitle">draw the BART from memory</h1>
+
+			<section class="card" id="card">
+				<header class="bar">
+					<div class="brand">
+						<span class="dot" id="lineDot"></span>
+						<span id="lineName">BART</span>
+					</div>
+					<div class="tagline" id="tagline">DID YOU DRAW WITH YOUR EYES CLOSED?</div>
+				</header>
+
+				<div class="stage" id="stage">
+					<div id="map"></div>
+					<canvas id="draw"></canvas>
+
+					<!-- MENU -->
+					<div class="overlay" id="menu">
+						<div class="menu-inner">
+							<p class="kicker">PICK A LINE</p>
+							<div class="lines" id="lineButtons"></div>
+							<button class="btn primary block" id="randomBtn">SURPRISE ME →</button>
+						</div>
+					</div>
+
+					<!-- DRAW HINT -->
+					<div class="hint" id="hint">
+						<span class="pen">✎</span> draw the line from memory
+					</div>
+
+					<!-- BANNER (results / celebration) -->
+					<div class="banner" id="banner"></div>
+				</div>
+
+				<footer class="bar bottom">
+					<div class="score">SCORE <b id="score">—</b> / 100</div>
+					<div class="controls" id="controls">
+						<button class="btn ghost" id="clearBtn" disabled>CLEAR</button>
+						<button class="btn primary" id="scoreBtn" disabled>SCORE IT</button>
+						<button class="btn ghost hidden" id="againBtn">NEW LINE</button>
+					</div>
+					<div class="legend">
+						<span class="leg"><i class="swatch you"></i> YOUR LINE</span>
+						<span class="leg"><i class="swatch actual" id="actualSwatch"></i> ACTUAL LINE</span>
+						<span class="dev">DEV <b id="dev">—</b></span>
+					</div>
+				</footer>
+
+				<!-- STATION NAMING -->
+				<div class="stationbar hidden" id="stationbar">
+					<div class="st-top">
+						<span class="prog">STATIONS <b id="stCount">0</b> / <b id="stTotal">0</b></span>
+						<div class="progbar"><i id="progFill"></i></div>
+						<button class="btn ghost" id="giveupBtn">GIVE UP</button>
+					</div>
+					<div class="ac-wrap">
+						<ul class="ac-list hidden" id="acList"></ul>
+						<input
+							id="stInput" type="text" spellcheck="false" autocomplete="off"
+							autocapitalize="off" placeholder="name a station on this line…" />
+					</div>
+				</div>
+			</section>
+
+			<p class="credit">
+				geometry from BART's public GTFS feed · basemap ©
+				<a href="https://carto.com/attributions" target="_blank" rel="noreferrer">CARTO</a>,
+				© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a>
+			</p>
+		</main>
+
+		<script
+			src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+			integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+			crossorigin=""
+			is:inline></script>
+
+		<script is:inline define:vars={{ dataJson }}>
+			const BART = JSON.parse(dataJson);
+
+			// ---------- DOM ----------
+			const $ = (id) => document.getElementById(id);
+			const stage = $('stage');
+			const canvas = $('draw');
+			const ctx = canvas.getContext('2d');
+			const els = {
+				lineName: $('lineName'), lineDot: $('lineDot'), tagline: $('tagline'),
+				menu: $('menu'), lineButtons: $('lineButtons'), randomBtn: $('randomBtn'),
+				hint: $('hint'), banner: $('banner'),
+				score: $('score'), dev: $('dev'),
+				clearBtn: $('clearBtn'), scoreBtn: $('scoreBtn'), againBtn: $('againBtn'),
+				actualSwatch: $('actualSwatch'),
+				stationbar: $('stationbar'), stInput: $('stInput'), acList: $('acList'),
+				stCount: $('stCount'), stTotal: $('stTotal'), progFill: $('progFill'),
+				giveupBtn: $('giveupBtn'),
+			};
+
+			const CITY_LABELS = [
+				['SAN FRANCISCO', 37.762, -122.446], ['OAKLAND', 37.79, -122.245],
+				['BERKELEY', 37.873, -122.29], ['RICHMOND', 37.945, -122.36],
+				['WALNUT CREEK', 37.92, -122.05], ['FREMONT', 37.55, -122.0],
+				['SAN JOSE', 37.33, -121.9], ['DALY CITY', 37.70, -122.48],
+				['ANTIOCH', 38.0, -121.83], ['DUBLIN', 37.715, -121.9],
+			];
+			const YOU_COLOR = '#111827';
+			const norm = (s) => s.toLowerCase().normalize('NFKD').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+
+			// ---------- STATE ----------
+			let map, allBounds, viewBounds;
+			let current = null, drawnLL = [], drawing = false;
+			let revealed = false, scored = false, revealT = 0;
+			let lastScore = 0, lastDev = 0;
+			let hairs = [];
+			// station phase
+			let stActive = false, stState = [], particles = [], acCands = [], acSel = 0;
+			let looping = false, lastT = 0;
+
+			// ---------- MAP ----------
+			function initMap() {
+				map = L.map('map', {
+					zoomControl: false, attributionControl: false,
+					dragging: false, scrollWheelZoom: false, doubleClickZoom: false,
+					boxZoom: false, keyboard: false, touchZoom: false, tap: false,
+				});
+				L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png',
+					{ maxZoom: 19, subdomains: 'abcd' }).addTo(map);
+				allBounds = L.latLngBounds([]);
+				for (const line of BART.lines)
+					for (const [lon, lat] of line.coords) allBounds.extend([lat, lon]);
+				viewBounds = allBounds;
+				refit();
+				map.on('move zoom', () => render());
+			}
+			function refit(animate) {
+				if (map && viewBounds) map.fitBounds(viewBounds, {
+					paddingTopLeft: [24, 30], paddingBottomRight: [24, 26], animate: !!animate,
+				});
+			}
+			function zoomToLine() {
+				const b = L.latLngBounds([]);
+				for (const [lon, lat] of current.coords) b.extend([lat, lon]);
+				for (const [lat, lon] of drawnLL) b.extend([lat, lon]);
+				viewBounds = b;
+				refit(true);
+			}
+
+			function fitCanvas() {
+				const r = stage.getBoundingClientRect();
+				const dpr = window.devicePixelRatio || 1;
+				canvas.width = Math.round(r.width * dpr);
+				canvas.height = Math.round(r.height * dpr);
+				canvas.style.width = r.width + 'px';
+				canvas.style.height = r.height + 'px';
+				ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+				if (map) { map.invalidateSize({ animate: false }); refit(); }
+				render();
+			}
+
+			// ---------- PROJECTION ----------
+			const P = (lat, lon) => { const p = map.latLngToContainerPoint([lat, lon]); return [p.x, p.y]; };
+			const projLine = (c) => c.map(([lon, lat]) => P(lat, lon));
+			const projDrawn = () => drawnLL.map(([lat, lon]) => P(lat, lon));
+
+			// ---------- GEOMETRY ----------
+			function distToSeg(p, a, b) {
+				const dx = b[0]-a[0], dy = b[1]-a[1], l2 = dx*dx + dy*dy;
+				let t = l2 ? ((p[0]-a[0])*dx + (p[1]-a[1])*dy) / l2 : 0;
+				t = Math.max(0, Math.min(1, t));
+				const fx = a[0]+t*dx, fy = a[1]+t*dy;
+				return { d: Math.hypot(p[0]-fx, p[1]-fy), foot: [fx, fy] };
+			}
+			function nearest(p, poly) {
+				let best = { d: Infinity, foot: p };
+				for (let i = 1; i < poly.length; i++) { const r = distToSeg(p, poly[i-1], poly[i]); if (r.d < best.d) best = r; }
+				return best;
+			}
+			function resample(poly, n) {
+				if (poly.length < 2) return poly.slice();
+				let total = 0; const seg = [];
+				for (let i = 1; i < poly.length; i++) { const d = Math.hypot(poly[i][0]-poly[i-1][0], poly[i][1]-poly[i-1][1]); seg.push(d); total += d; }
+				if (total === 0) return [poly[0]];
+				const step = total / (n - 1), out = [poly[0]];
+				let i = 1, acc = 0, target = step;
+				while (out.length < n - 1 && i < poly.length) {
+					const s = seg[i-1];
+					if (acc + s >= target) {
+						const t = (target - acc) / s;
+						out.push([poly[i-1][0] + t*(poly[i][0]-poly[i-1][0]), poly[i-1][1] + t*(poly[i][1]-poly[i-1][1])]);
+						target += step;
+					} else { acc += s; i++; }
+				}
+				out.push(poly[poly.length-1]);
+				return out;
+			}
+			const plen = (poly) => { let d = 0; for (let i = 1; i < poly.length; i++) d += Math.hypot(poly[i][0]-poly[i-1][0], poly[i][1]-poly[i-1][1]); return d; };
+
+			// ---------- SCORING ----------
+			const ZERO_AT = 0.11;
+			function computeScore() {
+				const actual = projLine(current.coords), drawn = projDrawn();
+				const refLen = plen(actual);
+				const dp = resample(drawn, 90);
+				// store endpoints as lat/lng so hairs stay aligned when the map zooms
+				hairs = dp.map((p) => {
+					const n = nearest(p, actual);
+					const a = map.containerPointToLatLng(p), b = map.containerPointToLatLng(n.foot);
+					return [[a.lat, a.lng], [b.lat, b.lng]];
+				});
+				const d1 = dp.reduce((s, p) => s + nearest(p, actual).d, 0) / dp.length;
+				const ap = resample(actual, 90);
+				const d2 = ap.reduce((s, p) => s + nearest(p, drawn).d, 0) / ap.length;
+				const avg = (d1 + d2) / 2, raw = avg / (ZERO_AT * refLen);
+				lastDev = Math.min(100, raw * 100);
+				lastScore = Math.max(0, Math.round(100 - lastDev));
+			}
+
+			// ---------- EASING ----------
+			const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+			const easeOutBack = (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+
+			// ---------- CANVAS PRIMITIVES ----------
+			function circle(x, y, r, fill, stroke, sw) {
+				ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2);
+				if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+				if (stroke) { ctx.lineWidth = sw || 2; ctx.strokeStyle = stroke; ctx.stroke(); }
+			}
+			function strokePoly(poly, color, w) {
+				if (poly.length < 2) return;
+				ctx.beginPath(); ctx.moveTo(poly[0][0], poly[0][1]);
+				for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
+				ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.lineWidth = w; ctx.strokeStyle = color; ctx.stroke();
+			}
+			function roundRect(x, y, w, h, r) {
+				ctx.beginPath(); ctx.moveTo(x+r, y);
+				ctx.arcTo(x+w, y, x+w, y+h, r); ctx.arcTo(x+w, y+h, x, y+h, r);
+				ctx.arcTo(x, y+h, x, y, r); ctx.arcTo(x, y, x+w, y, r); ctx.closePath();
+			}
+
+			// ---------- STATION RENDER ----------
+			function drawStations(now) {
+				ctx.font = '600 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+				ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+				const shown = [];
+				for (let i = 0; i < stState.length; i++) {
+					const st = stState[i];
+					const [x, y] = P(st.lat, st.lon);
+					if (!st.found && !st.missed) {
+						circle(x, y, 3.2, '#fff', '#b6bcc6', 1.6);              // hollow placeholder dot
+						const above = i % 2 === 0 ? -13 : 13;
+						ctx.strokeStyle = 'rgba(148,163,184,.7)'; ctx.lineWidth = 1;
+						roundRect(x - 9, y + above - 4, 18, 8, 3); ctx.stroke(); // blank label
+					} else {
+						const a = Math.min(1, (now - st.t0) / 380);
+						const pop = easeOutBack(Math.max(0, a));
+						const col = st.found ? current.color : '#f43f5e';
+						circle(x, y, 4.5 * (0.6 + 0.4 * Math.min(1, a * 1.4)), col, '#fff', 1.6);
+						shown.push({ st, x, y, i, a, pop, col });
+					}
+				}
+				// labels drawn on top, with halo
+				for (const { st, x, y, i, pop, col } of shown) {
+					const above = i % 2 === 0 ? -14 : 15;
+					const label = st.name;
+					const w = ctx.measureText(label).width + 12;
+					const bx = x - w / 2, by = y + above - 8, bh = 16;
+					ctx.save();
+					ctx.translate(x, y + above);
+					ctx.scale(pop, pop);
+					ctx.translate(-x, -(y + above));
+					roundRect(bx, by, w, bh, 5);
+					ctx.fillStyle = st.missed ? 'rgba(254,242,242,.96)' : '#fff';
+					ctx.fill();
+					ctx.lineWidth = 1.5; ctx.strokeStyle = col; ctx.stroke();
+					ctx.fillStyle = st.missed ? '#b91c1c' : '#111827';
+					ctx.fillText(label, x, y + above + 1);
+					ctx.restore();
+				}
+			}
+
+			function drawParticles() {
+				for (const p of particles) {
+					ctx.globalAlpha = Math.max(0, p.life / p.max);
+					ctx.fillStyle = p.color;
+					ctx.fillRect(p.x, p.y, p.s, p.s);
+				}
+				ctx.globalAlpha = 1;
+			}
+
+			// ---------- RENDER ----------
+			function render(now) {
+				if (!map) return;
+				now = now || performance.now();
+				const r = stage.getBoundingClientRect();
+				ctx.clearRect(0, 0, r.width, r.height);
+
+				// city labels
+				ctx.font = '600 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+				ctx.fillStyle = 'rgba(120,128,140,0.5)';
+				ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+				for (const [name, lat, lon] of CITY_LABELS) {
+					const [x, y] = P(lat, lon);
+					if (x < -60 || y < -20 || x > r.width+60 || y > r.height+20) continue;
+					ctx.fillText(name, x, y);
+				}
+
+				// deviation hairs
+				if (revealed && hairs.length) {
+					const cnt = Math.floor(hairs.length * revealT);
+					ctx.strokeStyle = current.color + '77'; ctx.lineWidth = 1;
+					for (let i = 0; i < cnt; i++) {
+						const [pa, pb] = hairs[i]; const p = P(pa[0], pa[1]), f = P(pb[0], pb[1]);
+						ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(f[0], f[1]); ctx.stroke();
+					}
+				}
+
+				// actual line
+				if (revealed) {
+					const actual = projLine(current.coords);
+					const cut = Math.max(2, Math.floor(actual.length * Math.min(1, revealT * 1.3)));
+					strokePoly(actual.slice(0, cut), current.color, 4);
+					if (revealT > 0.15) circle(actual[0][0], actual[0][1], 5, '#fff', current.color);
+					if (revealT >= 0.99) circle(actual.at(-1)[0], actual.at(-1)[1], 5, '#fff', current.color);
+				}
+
+				// drawn line
+				const drawn = projDrawn();
+				strokePoly(drawn, YOU_COLOR, 3);
+				if (drawn.length) {
+					circle(drawn[0][0], drawn[0][1], 4.5, '#fff', YOU_COLOR);
+					if (!drawing && drawn.length > 1) circle(drawn.at(-1)[0], drawn.at(-1)[1], 4.5, '#fff', YOU_COLOR);
+				}
+
+				if (stActive) drawStations(now);
+				if (particles.length) drawParticles();
+			}
+
+			// ---------- ANIM LOOP ----------
+			function anyAnimating(now) {
+				if (particles.length) return true;
+				for (const s of stState) if ((s.found || s.missed) && now - s.t0 < 420) return true;
+				return false;
+			}
+			function loop(now) {
+				const dt = Math.min(50, now - (lastT || now)); lastT = now;
+				// particles
+				for (const p of particles) { p.life -= dt; p.vy += 0.02 * dt; p.x += p.vx * dt; p.y += p.vy * dt; }
+				particles = particles.filter((p) => p.life > 0);
+				render(now);
+				if (anyAnimating(now)) requestAnimationFrame(loop);
+				else { looping = false; render(now); }
+			}
+			function kick() { if (!looping) { looping = true; lastT = performance.now(); requestAnimationFrame(loop); } }
+			function burst(x, y, color, n) {
+				for (let i = 0; i < n; i++) {
+					const a = Math.random() * Math.PI * 2, sp = 0.05 + Math.random() * 0.18;
+					particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 0.12, life: 500 + Math.random() * 400, max: 900, s: 2 + Math.random() * 3, color });
+				}
+				kick();
+			}
+			function confetti() {
+				const r = stage.getBoundingClientRect();
+				const cols = ['#FFC61A', '#0099CC', '#339933', '#ED1C24', '#FF9933'];
+				for (let i = 0; i < 90; i++) {
+					particles.push({ x: r.width * (0.15 + Math.random() * 0.7), y: -10, vx: (Math.random() - 0.5) * 0.25, vy: 0.1 + Math.random() * 0.25, life: 1400 + Math.random() * 900, max: 2300, s: 3 + Math.random() * 4, color: cols[i % cols.length] });
+				}
+				kick();
+			}
+
+			// ---------- DRAW INPUT ----------
+			function evtLL(e) {
+				const r = canvas.getBoundingClientRect();
+				const ll = map.containerPointToLatLng([e.clientX - r.left, e.clientY - r.top]);
+				return [ll.lat, ll.lng];
+			}
+			function pointerDown(e) {
+				if (scored || !current) return;
+				e.preventDefault(); drawing = true; drawnLL = [evtLL(e)];
+				canvas.setPointerCapture(e.pointerId); els.hint.classList.add('gone'); render();
+			}
+			function pointerMove(e) {
+				if (!drawing) return;
+				e.preventDefault();
+				const ll = evtLL(e), last = drawnLL[drawnLL.length - 1];
+				const [x, y] = P(ll[0], ll[1]), [lx, ly] = P(last[0], last[1]);
+				if (Math.hypot(x - lx, y - ly) < 2.5) return;
+				drawnLL.push(ll); render();
+			}
+			function pointerUp() {
+				if (!drawing) return;
+				drawing = false;
+				const enough = drawnLL.length > 4;
+				els.clearBtn.disabled = !enough; els.scoreBtn.disabled = !enough; render();
+			}
+
+			// ---------- FLOW ----------
+			function buildMenu() {
+				els.lineButtons.innerHTML = '';
+				for (const line of BART.lines) {
+					const b = document.createElement('button');
+					b.className = 'line-btn'; b.style.setProperty('--c', line.color);
+					b.innerHTML = `<i></i><span>${line.name}</span><small>${line.from} ↔ ${line.to}</small>`;
+					b.onclick = () => selectLine(line);
+					els.lineButtons.appendChild(b);
+				}
+			}
+			function selectLine(line) {
+				current = line; drawnLL = []; hairs = [];
+				revealed = false; scored = false; revealT = 0;
+				stActive = false; stState = []; particles = [];
+				viewBounds = allBounds;
+				els.menu.classList.add('gone'); els.hint.classList.remove('gone');
+				els.banner.classList.remove('show');
+				els.stationbar.classList.add('hidden');
+				els.lineDot.style.background = line.color;
+				els.actualSwatch.style.background = line.color;
+				els.lineName.textContent = line.name.toUpperCase();
+				els.tagline.textContent = `${line.from.toUpperCase()} → ${line.to.toUpperCase()}`;
+				els.score.textContent = '—'; els.dev.textContent = '—';
+				els.clearBtn.disabled = true; els.scoreBtn.disabled = true;
+				els.scoreBtn.classList.remove('hidden'); els.clearBtn.classList.remove('hidden');
+				els.againBtn.classList.add('hidden');
+				fitCanvas();
+			}
+			function clearDrawing() {
+				if (scored) return;
+				drawnLL = []; els.clearBtn.disabled = true; els.scoreBtn.disabled = true;
+				els.hint.classList.remove('gone'); render();
+			}
+			function verdict(s) {
+				if (s >= 90) return 'ARE YOU A TRAIN OPERATOR?';
+				if (s >= 75) return 'NICE. YOU KNOW THE BAY.';
+				if (s >= 55) return 'NOT BAD, COMMUTER.';
+				if (s >= 35) return 'ROUGHLY THE RIGHT IDEA.';
+				if (s >= 15) return 'DID YOU DRAW WITH YOUR EYES CLOSED?';
+				return 'THAT IS NOT A TRAIN LINE.';
+			}
+			function doScore() {
+				if (drawnLL.length < 5 || scored) return;
+				computeScore();
+				scored = true; revealed = true; revealT = 0;
+				zoomToLine();
+				els.hint.classList.add('gone');
+				els.scoreBtn.classList.add('hidden'); els.clearBtn.classList.add('hidden');
+				els.againBtn.classList.remove('hidden');
+				els.tagline.textContent = verdict(lastScore);
+				showBanner(`${lastScore}/100 — ${verdict(lastScore)}`);
+				const dur = 1100, start = performance.now();
+				function step(now) {
+					revealT = Math.min(1, (now - start) / dur);
+					const e = easeOutCubic(revealT);
+					els.score.textContent = Math.round(lastScore * e);
+					els.dev.textContent = (lastDev + (100 - lastDev) * (1 - e)).toFixed(1) + '%';
+					render(now);
+					if (revealT < 1) requestAnimationFrame(step);
+					else { els.score.textContent = lastScore; els.dev.textContent = lastDev.toFixed(1) + '%'; startStations(); }
+				}
+				requestAnimationFrame(step);
+			}
+			function showBanner(text, cls) {
+				els.banner.textContent = text;
+				els.banner.className = 'banner show' + (cls ? ' ' + cls : '');
+				clearTimeout(showBanner._t);
+				showBanner._t = setTimeout(() => els.banner.classList.remove('show'), 2200);
+			}
+
+			// ---------- STATION PHASE ----------
+			function startStations() {
+				stState = current.stations.map((s) => ({ name: s.name, lat: s.lat, lon: s.lon, found: false, missed: false, t0: 0 }));
+				stActive = true;
+				els.stationbar.classList.remove('hidden');
+				els.stCount.textContent = '0';
+				els.stTotal.textContent = stState.length;
+				els.progFill.style.width = '0%';
+				els.stInput.value = ''; els.stInput.disabled = false;
+				els.giveupBtn.disabled = false;
+				fitCanvas();
+				setTimeout(() => els.stInput.focus(), 60);
+			}
+			function foundCount() { return stState.filter((s) => s.found).length; }
+			function updateProgress() {
+				const c = foundCount(), t = stState.length;
+				els.stCount.textContent = c;
+				els.progFill.style.width = (100 * c / t) + '%';
+				els.stCount.classList.remove('pop'); void els.stCount.offsetWidth; els.stCount.classList.add('pop');
+			}
+			function claim(name) {
+				const key = norm(name);
+				const st = stState.find((s) => !s.found && !s.missed && norm(s.name) === key);
+				if (!st) {
+					// valid station but not on this line, or already found
+					const already = stState.find((s) => norm(s.name) === key && s.found);
+					flashInput(already ? 'dup' : 'bad');
+					showBanner(already ? 'ALREADY GOT THAT ONE' : 'NOT ON THIS LINE', 'warn');
+					return false;
+				}
+				st.found = true; st.t0 = performance.now();
+				const [x, y] = P(st.lat, st.lon);
+				burst(x, y, current.color, 16);
+				flashInput('ok');
+				updateProgress();
+				if (foundCount() === stState.length) finishStations();
+				return true;
+			}
+			function finishStations() {
+				els.stInput.disabled = true; els.giveupBtn.disabled = true;
+				hideAC();
+				confetti();
+				showBanner('PERFECT RECALL! ALL STATIONS NAMED 🎉', 'win');
+				els.tagline.textContent = 'PERFECT RECALL!';
+			}
+			function giveUp() {
+				let k = 0;
+				const base = performance.now();
+				for (const s of stState) if (!s.found) { s.missed = true; s.t0 = base + (k++) * 45; }
+				els.stInput.disabled = true; els.giveupBtn.disabled = true;
+				hideAC();
+				const got = foundCount();
+				showBanner(`REVEALED — YOU NAMED ${got} / ${stState.length}`, 'warn');
+				kick();
+			}
+
+			// ---------- AUTOCOMPLETE ----------
+			function candidates(q) {
+				const nq = norm(q);
+				if (!nq) return [];
+				const taken = new Set(stState.filter((s) => s.found).map((s) => norm(s.name)));
+				const pool = BART.allStations.filter((n) => !taken.has(norm(n)));
+				// match ONLY at the beginning of the (full) station name
+				return pool.filter((n) => norm(n).startsWith(nq)).slice(0, 6);
+			}
+			function renderAC() {
+				if (!acCands.length) { hideAC(); return; }
+				els.acList.innerHTML = '';
+				acCands.forEach((n, i) => {
+					const li = document.createElement('li');
+					li.textContent = n;
+					li.className = i === acSel ? 'sel' : '';
+					li.onmousedown = (e) => { e.preventDefault(); pick(n); };
+					els.acList.appendChild(li);
+				});
+				els.acList.classList.remove('hidden');
+			}
+			function hideAC() { els.acList.classList.add('hidden'); els.acList.innerHTML = ''; acCands = []; acSel = 0; }
+			function pick(name) { if (claim(name)) { els.stInput.value = ''; hideAC(); } else { els.stInput.select(); hideAC(); } }
+			function onInput() {
+				const v = els.stInput.value;
+				acCands = v.trim().length >= 4 ? candidates(v) : [];
+				acSel = 0; renderAC();
+			}
+			function onKey(e) {
+				if (e.key === 'ArrowDown') { if (acCands.length) { acSel = (acSel + 1) % acCands.length; renderAC(); e.preventDefault(); } }
+				else if (e.key === 'ArrowUp') { if (acCands.length) { acSel = (acSel - 1 + acCands.length) % acCands.length; renderAC(); e.preventDefault(); } }
+				else if (e.key === 'Enter') {
+					e.preventDefault();
+					const val = els.stInput.value.trim();
+					if (!val) return;
+					const cand = acCands.length ? acCands[acSel] : (candidates(val)[0] || val);
+					pick(cand);
+				} else if (e.key === 'Escape') hideAC();
+			}
+			function flashInput(kind) {
+				const el = els.stInput;
+				el.classList.remove('ok', 'bad', 'dup');
+				void el.offsetWidth;
+				el.classList.add(kind);
+				setTimeout(() => el.classList.remove(kind), 500);
+			}
+
+			function reset() {
+				current = null; drawnLL = []; hairs = []; particles = [];
+				revealed = false; scored = false; revealT = 0; stActive = false; stState = [];
+				viewBounds = allBounds; refit(true);
+				els.menu.classList.remove('gone'); els.hint.classList.add('gone');
+				els.banner.classList.remove('show');
+				els.stationbar.classList.add('hidden');
+				els.lineName.textContent = 'BART'; els.lineDot.style.background = '#9aa3af';
+				els.tagline.textContent = 'DID YOU DRAW WITH YOUR EYES CLOSED?';
+				els.score.textContent = '—'; els.dev.textContent = '—';
+				els.scoreBtn.classList.remove('hidden'); els.clearBtn.classList.remove('hidden');
+				els.againBtn.classList.add('hidden');
+				render();
+			}
+
+			// ---------- WIRE UP ----------
+			els.randomBtn.onclick = () => selectLine(BART.lines[Math.floor(Math.random() * BART.lines.length)]);
+			els.clearBtn.onclick = clearDrawing;
+			els.scoreBtn.onclick = doScore;
+			els.againBtn.onclick = reset;
+			els.giveupBtn.onclick = giveUp;
+			els.stInput.addEventListener('input', onInput);
+			els.stInput.addEventListener('keydown', onKey);
+			els.stInput.addEventListener('blur', () => setTimeout(hideAC, 120));
+			canvas.addEventListener('pointerdown', pointerDown);
+			canvas.addEventListener('pointermove', pointerMove);
+			canvas.addEventListener('pointerup', pointerUp);
+			canvas.addEventListener('pointercancel', pointerUp);
+			window.addEventListener('resize', fitCanvas);
+
+			// ---------- BOOT ----------
+			buildMenu(); initMap(); fitCanvas();
+			setTimeout(fitCanvas, 220);
+		</script>
+
+		<style is:global>
+			:root {
+				--bg: #0b0b0d; --card: #ffffff; --ink: #111827; --muted: #6b7280;
+				--line: #e5e7eb; --accent: #ff6a00; --ok: #16a34a; --bad: #ef4444;
+			}
+			* { box-sizing: border-box; }
+			html, body { margin: 0; height: 100%; }
+			body {
+				background: var(--bg); color: #e7e7ea;
+				font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+				height: 100dvh; overflow: hidden;
+				display: flex; align-items: center; justify-content: center;
+				padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+			}
+			.page {
+				width: 100%; max-width: 560px; height: 100%;
+				display: flex; flex-direction: column; gap: 8px; min-height: 0;
+			}
+			.pagetitle {
+				font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+				font-size: 17px; font-weight: 700; margin: 0; color: #f4f4f6; flex: none;
+			}
+			.card {
+				background: var(--card); color: var(--ink);
+				border-radius: 14px; overflow: hidden;
+				box-shadow: 0 20px 60px rgba(0,0,0,.5);
+				display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
+			}
+			.bar {
+				display: flex; align-items: center; justify-content: space-between;
+				gap: 10px; padding: 9px 14px; font-size: 11px; letter-spacing: .05em; flex: none;
+			}
+			.brand { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+			.dot { width: 13px; height: 13px; border-radius: 50%; background: #9aa3af; transition: background .2s; }
+			.tagline { color: var(--muted); text-align: right; }
+
+			.stage {
+				position: relative; flex: 1 1 auto; min-height: 0;
+				margin: 0 12px; border: 1px solid var(--line); border-radius: 6px;
+				overflow: hidden; background: #f3f4f6; touch-action: none;
+			}
+			#map { position: absolute; inset: 0; z-index: 1; }
+			#draw { position: absolute; inset: 0; z-index: 2; cursor: crosshair; touch-action: none; }
+			.leaflet-container { background: #f3f4f6 !important; }
+
+			.overlay {
+				position: absolute; inset: 0; z-index: 4;
+				display: flex; align-items: center; justify-content: center;
+				background: rgba(255,255,255,.84); backdrop-filter: blur(2px);
+				transition: opacity .25s ease;
+			}
+			.overlay.gone, .hint.gone { opacity: 0; pointer-events: none; }
+			.menu-inner { width: 100%; max-width: 360px; padding: 18px; }
+			.kicker { font-size: 11px; letter-spacing: .12em; color: var(--muted); margin: 0 0 10px; text-align: center; }
+			.lines { display: flex; flex-direction: column; gap: 7px; }
+			.line-btn {
+				display: grid; grid-template-columns: 15px 1fr; grid-template-rows: auto auto;
+				gap: 0 10px; align-items: center; text-align: left;
+				background: #fff; border: 1px solid var(--line); border-radius: 10px;
+				padding: 8px 12px; cursor: pointer; transition: .15s; font-family: inherit;
+			}
+			.line-btn:hover { border-color: #c7ccd4; transform: translateY(-1px); box-shadow: 0 4px 14px rgba(0,0,0,.08); }
+			.line-btn i { grid-row: 1 / 3; width: 14px; height: 14px; border-radius: 50%; background: var(--c); }
+			.line-btn span { font-weight: 700; font-size: 13px; color: var(--ink); }
+			.line-btn small { font-size: 10px; color: var(--muted); letter-spacing: .03em; }
+
+			.hint {
+				position: absolute; z-index: 3; left: 50%; bottom: 12px; transform: translateX(-50%);
+				background: rgba(17,24,39,.86); color: #fff; padding: 6px 13px; border-radius: 999px;
+				font-size: 11px; letter-spacing: .05em; transition: opacity .25s ease; white-space: nowrap;
+			}
+			.hint .pen { margin-right: 6px; }
+
+			.banner {
+				position: absolute; z-index: 5; left: 50%; top: 12px; transform: translate(-50%, -14px);
+				background: rgba(17,24,39,.92); color: #fff; padding: 7px 15px; border-radius: 999px;
+				font-size: 11px; letter-spacing: .04em; white-space: nowrap; opacity: 0;
+				transition: opacity .25s ease, transform .25s ease; pointer-events: none; max-width: 92%;
+				overflow: hidden; text-overflow: ellipsis;
+			}
+			.banner.show { opacity: 1; transform: translate(-50%, 0); }
+			.banner.win { background: #0f7b3f; }
+			.banner.warn { background: #b45309; }
+
+			.bottom { border-top: 1px solid var(--line); flex-wrap: wrap; }
+			.score b { font-size: 14px; } .score, .dev { white-space: nowrap; }
+			.controls { display: flex; gap: 7px; }
+			.legend { display: flex; align-items: center; gap: 12px; color: var(--muted); }
+			.leg { display: flex; align-items: center; gap: 6px; }
+			.swatch { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+			.swatch.you { background: var(--ink); } .swatch.actual { background: var(--accent); }
+			.dev b { color: var(--ink); }
+
+			.btn {
+				font-family: inherit; font-size: 11px; letter-spacing: .05em; font-weight: 700;
+				border-radius: 8px; padding: 7px 11px; cursor: pointer; transition: .15s;
+				border: 1px solid var(--line); background: #fff; color: var(--ink);
+			}
+			.btn:hover:not(:disabled) { border-color: #c7ccd4; }
+			.btn:disabled { opacity: .4; cursor: not-allowed; }
+			.btn.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
+			.btn.primary:hover:not(:disabled) { background: #000; }
+			.btn.block { width: 100%; margin-top: 10px; }
+			.btn.hidden { display: none; }
+
+			/* station bar */
+			.stationbar { border-top: 1px solid var(--line); padding: 9px 14px 11px; flex: none; display: flex; flex-direction: column; gap: 8px; }
+			.stationbar.hidden { display: none; }
+			.st-top { display: flex; align-items: center; gap: 12px; font-size: 11px; letter-spacing: .05em; color: var(--muted); }
+			.prog b { color: var(--ink); font-size: 13px; }
+			.prog b.pop { animation: pop .3s ease; }
+			.progbar { flex: 1; height: 6px; background: #eef0f3; border-radius: 999px; overflow: hidden; }
+			.progbar i { display: block; height: 100%; width: 0; border-radius: 999px; background: linear-gradient(90deg, #16a34a, #22c55e); transition: width .35s cubic-bezier(.2,.8,.2,1); }
+			.ac-wrap { position: relative; }
+			#stInput {
+				width: 100%; font-family: inherit; font-size: 13px; padding: 10px 12px;
+				border: 1.5px solid var(--line); border-radius: 9px; color: var(--ink); background: #fff;
+				outline: none; transition: border-color .15s, box-shadow .15s, background .2s;
+			}
+			#stInput:focus { border-color: #94a3b8; box-shadow: 0 0 0 3px rgba(148,163,184,.18); }
+			#stInput::placeholder { color: #9aa3af; }
+			#stInput.ok { border-color: var(--ok); box-shadow: 0 0 0 3px rgba(22,163,74,.2); background: #f0fdf4; }
+			#stInput.bad { border-color: var(--bad); animation: shake .4s; }
+			#stInput.dup { border-color: #d97706; }
+			#stInput:disabled { background: #f8fafc; color: #9aa3af; }
+			.ac-list {
+				position: absolute; left: 0; right: 0; bottom: calc(100% + 6px);
+				list-style: none; margin: 0; padding: 4px; background: #fff;
+				border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 -8px 24px rgba(0,0,0,.12);
+				max-height: 190px; overflow: auto; z-index: 6;
+			}
+			.ac-list.hidden { display: none; }
+			.ac-list li { padding: 8px 10px; font-size: 12.5px; border-radius: 7px; cursor: pointer; color: #374151; }
+			.ac-list li.sel { background: #111827; color: #fff; font-weight: 700; }
+			.ac-list li:not(.sel):hover { background: #f3f4f6; }
+
+			.credit { color: #6b7280; font-size: 9.5px; letter-spacing: .02em; margin: 0 2px; line-height: 1.5; flex: none; }
+			.credit a { color: #9aa3af; }
+
+			@keyframes pop { 0% { transform: scale(1); } 40% { transform: scale(1.5); color: var(--ok); } 100% { transform: scale(1); } }
+			@keyframes shake { 0%,100% { transform: translateX(0); } 20% { transform: translateX(-6px); } 40% { transform: translateX(5px); } 60% { transform: translateX(-4px); } 80% { transform: translateX(3px); } }
+
+			@media (max-height: 680px) { .pagetitle, .credit { display: none; } }
+			@media (max-width: 520px) {
+				.legend { width: 100%; justify-content: space-between; order: 3; margin-top: 4px; }
+				.tagline { font-size: 10px; max-width: 55%; }
+			}
+		</style>
 	</body>
 </html>
