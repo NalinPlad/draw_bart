@@ -40,12 +40,22 @@ const dataJson = JSON.stringify(bart);
 							<p class="kicker">PICK A LINE</p>
 							<div class="lines" id="lineButtons"></div>
 							<button class="btn primary block" id="randomBtn">SURPRISE ME →</button>
+							<div class="menu-div"><span>OR GO ALL IN</span></div>
+							<button class="btn hard block" id="hardBtn">☠ HARD MODE — DRAW EVERY LINE</button>
 						</div>
 					</div>
 
 					<!-- DRAW HINT -->
 					<div class="hint" id="hint">
 						<span class="pen">✎</span> draw the line from memory
+					</div>
+
+					<!-- DRAWING TOOLS (hard mode) -->
+					<div class="tools hidden" id="tools">
+						<div class="swatches" id="swatches"></div>
+						<span class="tsep"></span>
+						<button class="tbtn" id="undoBtn" title="Undo last stroke" disabled>↶</button>
+						<button class="tbtn allbtn hidden" id="allBtn" title="Show all lines">ALL</button>
 					</div>
 
 					<!-- BANNER (results / celebration) -->
@@ -106,6 +116,7 @@ const dataJson = JSON.stringify(bart);
 			const els = {
 				lineName: $('lineName'), lineDot: $('lineDot'), tagline: $('tagline'),
 				menu: $('menu'), lineButtons: $('lineButtons'), randomBtn: $('randomBtn'),
+				hardBtn: $('hardBtn'), tools: $('tools'), swatches: $('swatches'), undoBtn: $('undoBtn'), allBtn: $('allBtn'),
 				hint: $('hint'), banner: $('banner'),
 				score: $('score'), dev: $('dev'),
 				clearBtn: $('clearBtn'), scoreBtn: $('scoreBtn'), againBtn: $('againBtn'),
@@ -124,10 +135,13 @@ const dataJson = JSON.stringify(bart);
 			];
 			const YOU_COLOR = '#111827';
 			const norm = (s) => s.toLowerCase().normalize('NFKD').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+			const stColor = () => (current ? current.color : '#0ea5e9');
 
 			// ---------- STATE ----------
 			let map, allBounds, viewBounds, zoomCtl;
+			let mode = 'easy';          // 'easy' (one line) | 'hard' (all lines at once)
 			let current = null, drawnLL = [], drawing = false;
+			let strokes = [], curStroke = null, selColor = 0, hardResults = null, reviewFilter = null;
 			let revealed = false, scored = false, revealT = 0;
 			let lastScore = 0, lastDev = 0;
 			let hairs = [];
@@ -243,6 +257,33 @@ const dataJson = JSON.stringify(bart);
 				lastDev = Math.min(100, raw * 100);
 				lastScore = Math.max(0, Math.round(100 - lastDev));
 			}
+			// hard mode: score each line against the strokes drawn in its color
+			function nearestMulti(p, polys) { let d = Infinity; for (const poly of polys) { const r = nearest(p, poly); if (r.d < d) d = r.d; } return d; }
+			function scoreLine(actualPx, polys) {
+				if (!polys.length) return { score: 0, dev: 100 };
+				const refLen = plen(actualPx);
+				let s1 = 0, c1 = 0;
+				for (const poly of polys) { for (const p of resample(poly, 40)) { s1 += nearest(p, actualPx).d; c1++; } }
+				const d1 = s1 / c1;
+				const ap = resample(actualPx, 90);
+				let s2 = 0; for (const p of ap) s2 += nearestMulti(p, polys);
+				const d2 = s2 / ap.length;
+				const dev = Math.min(100, (d1 + d2) / 2 / (ZERO_AT * refLen) * 100);
+				return { score: Math.max(0, Math.round(100 - dev)), dev };
+			}
+			function computeScoreHard() {
+				hardResults = []; let sSum = 0, dSum = 0;
+				for (const line of BART.lines) {
+					const actualPx = projLine(line.coords);
+					const polys = strokes.filter((s) => s.key === line.key && s.pts.length > 1)
+						.map((s) => s.pts.map(([lat, lon]) => P(lat, lon)));
+					const r = scoreLine(actualPx, polys);
+					hardResults.push({ key: line.key, name: line.name, color: line.color, ...r });
+					sSum += r.score; dSum += r.dev;
+				}
+				lastScore = Math.round(sSum / BART.lines.length);
+				lastDev = dSum / BART.lines.length;
+			}
 
 			// ---------- EASING ----------
 			const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
@@ -282,7 +323,7 @@ const dataJson = JSON.stringify(bart);
 					} else {
 						const a = Math.min(1, (now - st.t0) / 380);
 						const pop = easeOutBack(Math.max(0, a));
-						const col = st.found ? current.color : '#f43f5e';
+						const col = st.found ? stColor() : '#f43f5e';
 						circle(x, y, 4.5 * (0.6 + 0.4 * Math.min(1, a * 1.4)), col, '#fff', 1.6);
 						shown.push({ st, x, y, i, a, pop, col });
 					}
@@ -333,31 +374,53 @@ const dataJson = JSON.stringify(bart);
 					ctx.fillText(name, x, y);
 				}
 
-				// deviation hairs
-				if (revealed && hairs.length) {
-					const cnt = Math.floor(hairs.length * revealT);
-					ctx.strokeStyle = current.color + '77'; ctx.lineWidth = 1;
-					for (let i = 0; i < cnt; i++) {
-						const [pa, pb] = hairs[i]; const p = P(pa[0], pa[1]), f = P(pb[0], pb[1]);
-						ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(f[0], f[1]); ctx.stroke();
+				if (mode === 'hard') {
+					const vis = (k) => !reviewFilter || k === reviewFilter;
+					// reveal: soft "ghost" of the real line(s) underneath
+					if (revealed) {
+						for (const line of BART.lines) {
+							if (!vis(line.key)) continue;
+							const a = projLine(line.coords);
+							ctx.globalAlpha = (reviewFilter ? 0.4 : 0.3) * revealT;
+							strokePoly(a, line.color, 7);
+							ctx.globalAlpha = 1;
+							if (reviewFilter) { // crisp dashed "real path" when a line is isolated
+								ctx.setLineDash([7, 6]); strokePoly(a, line.color, 2.5); ctx.setLineDash([]);
+							}
+							if (revealT > 0.2) circle(a[0][0], a[0][1], 4, '#fff', line.color, 1.6);
+							if (revealT >= 0.99) circle(a.at(-1)[0], a.at(-1)[1], 4, '#fff', line.color, 1.6);
+						}
 					}
-				}
-
-				// actual line
-				if (revealed) {
-					const actual = projLine(current.coords);
-					const cut = Math.max(2, Math.floor(actual.length * Math.min(1, revealT * 1.3)));
-					strokePoly(actual.slice(0, cut), current.color, 4);
-					if (revealT > 0.15) circle(actual[0][0], actual[0][1], 5, '#fff', current.color);
-					if (revealT >= 0.99) circle(actual.at(-1)[0], actual.at(-1)[1], 5, '#fff', current.color);
-				}
-
-				// drawn line
-				const drawn = projDrawn();
-				strokePoly(drawn, YOU_COLOR, 3);
-				if (drawn.length) {
-					circle(drawn[0][0], drawn[0][1], 4.5, '#fff', YOU_COLOR);
-					if (!drawing && drawn.length > 1) circle(drawn.at(-1)[0], drawn.at(-1)[1], 4.5, '#fff', YOU_COLOR);
+					// your strokes, each in its picked color
+					for (const s of strokes) {
+						if (!vis(s.key)) continue;
+						strokePoly(s.pts.map(([lat, lon]) => P(lat, lon)), s.color, 3.5);
+					}
+				} else {
+					// deviation hairs
+					if (revealed && hairs.length) {
+						const cnt = Math.floor(hairs.length * revealT);
+						ctx.strokeStyle = current.color + '77'; ctx.lineWidth = 1;
+						for (let i = 0; i < cnt; i++) {
+							const [pa, pb] = hairs[i]; const p = P(pa[0], pa[1]), f = P(pb[0], pb[1]);
+							ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(f[0], f[1]); ctx.stroke();
+						}
+					}
+					// actual line
+					if (revealed) {
+						const actual = projLine(current.coords);
+						const cut = Math.max(2, Math.floor(actual.length * Math.min(1, revealT * 1.3)));
+						strokePoly(actual.slice(0, cut), current.color, 4);
+						if (revealT > 0.15) circle(actual[0][0], actual[0][1], 5, '#fff', current.color);
+						if (revealT >= 0.99) circle(actual.at(-1)[0], actual.at(-1)[1], 5, '#fff', current.color);
+					}
+					// drawn line
+					const drawn = projDrawn();
+					strokePoly(drawn, YOU_COLOR, 3);
+					if (drawn.length) {
+						circle(drawn[0][0], drawn[0][1], 4.5, '#fff', YOU_COLOR);
+						if (!drawing && drawn.length > 1) circle(drawn.at(-1)[0], drawn.at(-1)[1], 4.5, '#fff', YOU_COLOR);
+					}
 				}
 
 				if (stActive) drawStations(now);
@@ -403,21 +466,38 @@ const dataJson = JSON.stringify(bart);
 				return [ll.lat, ll.lng];
 			}
 			function pointerDown(e) {
-				if (scored || !current) return;
+				if (scored) return;
+				if (mode === 'hard') {
+					e.preventDefault(); drawing = true;
+					curStroke = { key: BART.lines[selColor].key, color: BART.lines[selColor].color, pts: [evtLL(e)] };
+					strokes.push(curStroke);
+					canvas.setPointerCapture(e.pointerId); els.hint.classList.add('gone'); render(); return;
+				}
+				if (!current) return;
 				e.preventDefault(); drawing = true; drawnLL = [evtLL(e)];
 				canvas.setPointerCapture(e.pointerId); els.hint.classList.add('gone'); render();
 			}
 			function pointerMove(e) {
 				if (!drawing) return;
 				e.preventDefault();
-				const ll = evtLL(e), last = drawnLL[drawnLL.length - 1];
+				const ll = evtLL(e);
+				const track = mode === 'hard' ? curStroke.pts : drawnLL;
+				const last = track[track.length - 1];
 				const [x, y] = P(ll[0], ll[1]), [lx, ly] = P(last[0], last[1]);
 				if (Math.hypot(x - lx, y - ly) < 2.5) return;
-				drawnLL.push(ll); render();
+				track.push(ll); render();
 			}
 			function pointerUp() {
 				if (!drawing) return;
 				drawing = false;
+				if (mode === 'hard') {
+					if (curStroke && curStroke.pts.length < 3) strokes.pop(); // discard tiny taps
+					curStroke = null;
+					const any = strokes.some((s) => s.pts.length > 1);
+					els.clearBtn.disabled = !any; els.scoreBtn.disabled = !any;
+					els.undoBtn.disabled = !strokes.length;
+					updateSwatches(); render(); return;
+				}
 				const enough = drawnLL.length > 4;
 				els.clearBtn.disabled = !enough; els.scoreBtn.disabled = !enough; render();
 			}
@@ -434,12 +514,16 @@ const dataJson = JSON.stringify(bart);
 				}
 			}
 			function selectLine(line) {
-				current = line; drawnLL = []; hairs = [];
+				mode = 'easy';
+				current = line; drawnLL = []; hairs = []; strokes = [];
 				revealed = false; scored = false; revealT = 0;
 				stActive = false; stState = []; particles = [];
 				viewBounds = allBounds;
 				setMapInteract(false);
-				els.menu.classList.add('gone'); els.hint.classList.remove('gone');
+				els.menu.classList.add('gone');
+				els.tools.classList.add('hidden');
+				els.hint.innerHTML = '<span class="pen">✎</span> draw the line from memory';
+				els.hint.classList.remove('gone');
 				els.banner.classList.remove('show');
 				els.stationbar.classList.add('hidden');
 				els.lineDot.style.background = line.color;
@@ -452,8 +536,83 @@ const dataJson = JSON.stringify(bart);
 				els.againBtn.classList.add('hidden');
 				fitCanvas();
 			}
+			// ---------- HARD MODE ----------
+			function buildTools() {
+				els.swatches.innerHTML = '';
+				BART.lines.forEach((l, i) => {
+					const b = document.createElement('button');
+					b.className = 'swatch-btn';
+					b.style.background = l.color; b.title = l.name;
+					// while drawing → pick color; while reviewing → isolate that line
+					b.onclick = () => { if (scored) setFilter(i); else { selColor = i; updateSwatches(); } };
+					els.swatches.appendChild(b);
+				});
+				updateSwatches();
+			}
+			function updateSwatches() {
+				[...els.swatches.children].forEach((b, i) => {
+					const key = BART.lines[i].key;
+					if (scored) {
+						b.classList.toggle('sel', reviewFilter === key);
+						b.classList.toggle('dim', !!reviewFilter && reviewFilter !== key);
+						b.classList.remove('done');
+					} else {
+						b.classList.toggle('sel', i === selColor);
+						b.classList.toggle('done', strokes.some((s) => s.key === key && s.pts.length > 1));
+						b.classList.remove('dim');
+					}
+				});
+				if (els.allBtn) els.allBtn.classList.toggle('sel', scored && !reviewFilter);
+			}
+			// review: isolate a single line (its attempt + real path); click again to clear
+			function setFilter(i) {
+				const key = BART.lines[i].key;
+				reviewFilter = reviewFilter === key ? null : key;
+				updateSwatches(); render();
+				if (reviewFilter && hardResults) {
+					const r = hardResults.find((h) => h.key === key);
+					if (r) showBanner(`${r.name.toUpperCase()} — ${r.score}/100`);
+				}
+			}
+			function startHard() {
+				mode = 'hard'; current = null; drawnLL = []; hairs = [];
+				strokes = []; curStroke = null; selColor = 0; hardResults = null; reviewFilter = null;
+				revealed = false; scored = false; revealT = 0;
+				stActive = false; stState = []; particles = [];
+				viewBounds = allBounds; setMapInteract(false);
+				els.menu.classList.add('gone');
+				els.hint.classList.add('gone');
+				els.tools.classList.remove('hidden');
+				els.banner.classList.remove('show');
+				els.stationbar.classList.add('hidden');
+				els.lineDot.style.background = '#111827';
+				els.actualSwatch.style.background = '#111827';
+				els.lineName.textContent = 'HARD MODE';
+				els.tagline.textContent = 'DRAW EVERY LINE';
+				els.score.textContent = '—'; els.dev.textContent = '—';
+				els.clearBtn.disabled = true; els.scoreBtn.disabled = true;
+				els.undoBtn.disabled = true;
+				els.undoBtn.classList.remove('hidden'); els.allBtn.classList.add('hidden');
+				els.scoreBtn.classList.remove('hidden'); els.clearBtn.classList.remove('hidden');
+				els.againBtn.classList.add('hidden');
+				buildTools(); fitCanvas();
+				showBanner('PICK A COLOR & DRAW ALL 5 LINES');
+			}
+			function undoStroke() {
+				if (scored || mode !== 'hard' || !strokes.length) return;
+				strokes.pop();
+				const any = strokes.some((s) => s.pts.length > 1);
+				els.clearBtn.disabled = !any; els.scoreBtn.disabled = !any;
+				els.undoBtn.disabled = !strokes.length;
+				updateSwatches(); render();
+			}
 			function clearDrawing() {
 				if (scored) return;
+				if (mode === 'hard') {
+					strokes = []; curStroke = null; els.undoBtn.disabled = true; updateSwatches();
+					els.clearBtn.disabled = true; els.scoreBtn.disabled = true;
+					showBanner('CLEARED — DRAW ALL 5 LINES'); render(); return;
+				}
 				drawnLL = []; els.clearBtn.disabled = true; els.scoreBtn.disabled = true;
 				els.hint.classList.remove('gone'); render();
 			}
@@ -466,10 +625,22 @@ const dataJson = JSON.stringify(bart);
 				return 'THAT IS NOT A TRAIN LINE.';
 			}
 			function doScore() {
-				if (drawnLL.length < 5 || scored) return;
-				computeScore();
+				if (scored) return;
+				if (mode === 'hard') {
+					if (!strokes.some((s) => s.pts.length > 1)) return;
+					computeScoreHard();
+					viewBounds = allBounds; refit(true);
+					// keep the picker as a per-line filter for reviewing
+					reviewFilter = null;
+					els.undoBtn.classList.add('hidden');
+					els.allBtn.classList.remove('hidden');
+					updateSwatches();
+				} else {
+					if (drawnLL.length < 5) return;
+					computeScore();
+					zoomToLine();
+				}
 				scored = true; revealed = true; revealT = 0;
-				zoomToLine();
 				els.hint.classList.add('gone');
 				els.scoreBtn.classList.add('hidden'); els.clearBtn.classList.add('hidden');
 				els.againBtn.classList.remove('hidden');
@@ -495,14 +666,24 @@ const dataJson = JSON.stringify(bart);
 			}
 
 			// ---------- STATION PHASE ----------
+			function unionStations() {
+				const m = new Map();
+				for (const l of BART.lines) for (const s of l.stations) {
+					const k = norm(s.name);
+					if (!m.has(k)) m.set(k, { name: s.name, lat: s.lat, lon: s.lon });
+				}
+				return [...m.values()];
+			}
 			function startStations() {
-				stState = current.stations.map((s) => ({ name: s.name, lat: s.lat, lon: s.lon, found: false, missed: false, t0: 0 }));
+				const src = mode === 'hard' ? unionStations() : current.stations;
+				stState = src.map((s) => ({ name: s.name, lat: s.lat, lon: s.lon, found: false, missed: false, t0: 0 }));
 				stActive = true;
 				els.stationbar.classList.remove('hidden');
 				els.stCount.textContent = '0';
 				els.stTotal.textContent = stState.length;
 				els.progFill.style.width = '0%';
 				els.stInput.value = ''; els.stInput.disabled = false;
+				els.stInput.placeholder = mode === 'hard' ? 'name every station on the map…' : 'name a station on this line…';
 				els.giveupBtn.disabled = false;
 				fitCanvas();
 				setMapInteract(true);
@@ -522,12 +703,12 @@ const dataJson = JSON.stringify(bart);
 					// valid station but not on this line, or already found
 					const already = stState.find((s) => norm(s.name) === key && s.found);
 					flashInput(already ? 'dup' : 'bad');
-					showBanner(already ? 'ALREADY GOT THAT ONE' : 'NOT ON THIS LINE', 'warn');
+					showBanner(already ? 'ALREADY GOT THAT ONE' : (mode === 'hard' ? 'NOT ON THESE LINES' : 'NOT ON THIS LINE'), 'warn');
 					return false;
 				}
 				st.found = true; st.t0 = performance.now();
 				const [x, y] = P(st.lat, st.lon);
-				burst(x, y, current.color, 16);
+				burst(x, y, stColor(), 16);
 				flashInput('ok');
 				updateProgress();
 				if (foundCount() === stState.length) finishStations();
@@ -599,10 +780,14 @@ const dataJson = JSON.stringify(bart);
 			}
 
 			function reset() {
+				mode = 'easy';
 				current = null; drawnLL = []; hairs = []; particles = [];
+				strokes = []; curStroke = null; hardResults = null; reviewFilter = null;
 				revealed = false; scored = false; revealT = 0; stActive = false; stState = [];
 				viewBounds = allBounds; setMapInteract(false); refit(true);
 				els.menu.classList.remove('gone'); els.hint.classList.add('gone');
+				els.tools.classList.add('hidden');
+				els.undoBtn.classList.remove('hidden'); els.allBtn.classList.add('hidden');
 				els.banner.classList.remove('show');
 				els.stationbar.classList.add('hidden');
 				els.lineName.textContent = 'BART'; els.lineDot.style.background = '#9aa3af';
@@ -615,6 +800,9 @@ const dataJson = JSON.stringify(bart);
 
 			// ---------- WIRE UP ----------
 			els.randomBtn.onclick = () => selectLine(BART.lines[Math.floor(Math.random() * BART.lines.length)]);
+			els.hardBtn.onclick = startHard;
+			els.undoBtn.onclick = undoStroke;
+			els.allBtn.onclick = () => { reviewFilter = null; updateSwatches(); render(); };
 			els.clearBtn.onclick = clearDrawing;
 			els.scoreBtn.onclick = doScore;
 			els.againBtn.onclick = reset;
@@ -698,6 +886,43 @@ const dataJson = JSON.stringify(bart);
 			.line-btn i { grid-row: 1 / 3; width: 14px; height: 14px; border-radius: 50%; background: var(--c); }
 			.line-btn span { font-weight: 700; font-size: 13px; color: var(--ink); }
 			.line-btn small { font-size: 10px; color: var(--muted); letter-spacing: .03em; }
+
+			.menu-div { display: flex; align-items: center; gap: 8px; margin: 12px 0 8px; color: #9aa3af; font-size: 9px; letter-spacing: .12em; }
+			.menu-div::before, .menu-div::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+			.btn.hard { background: #111827; color: #fff; border-color: #111827; }
+			.btn.hard:hover:not(:disabled) { background: #000; border-color: #000; }
+
+			.tools {
+				position: absolute; z-index: 5; left: 50%; bottom: 12px; transform: translateX(-50%);
+				display: flex; align-items: center; gap: 9px;
+				background: rgba(255,255,255,.96); border: 1px solid var(--line);
+				border-radius: 999px; padding: 6px 11px; box-shadow: 0 6px 22px rgba(0,0,0,.16);
+			}
+			.tools.hidden { display: none; }
+			.swatches { display: flex; gap: 7px; }
+			.swatch-btn {
+				width: 23px; height: 23px; border-radius: 50%; border: 2px solid #fff;
+				box-shadow: 0 0 0 1px rgba(0,0,0,.18); cursor: pointer; position: relative;
+				transition: transform .12s, box-shadow .12s; padding: 0;
+			}
+			.swatch-btn:hover { transform: scale(1.12); }
+			.swatch-btn.sel { box-shadow: 0 0 0 2px #111827; transform: scale(1.14); }
+			.swatch-btn.dim { opacity: .3; }
+			.swatch-btn.done::after {
+				content: '✓'; position: absolute; inset: 0; display: flex; align-items: center;
+				justify-content: center; font-size: 12px; font-weight: 700; color: #fff;
+				text-shadow: 0 0 3px rgba(0,0,0,.7);
+			}
+			.tsep { width: 1px; height: 20px; background: var(--line); }
+			.tbtn {
+				border: none; background: #f3f4f6; width: 27px; height: 27px; border-radius: 8px;
+				cursor: pointer; font-size: 15px; color: #374151; line-height: 1; transition: background .12s;
+			}
+			.tbtn:hover:not(:disabled) { background: #e5e7eb; }
+			.tbtn:disabled { opacity: .4; cursor: not-allowed; }
+			.tbtn.hidden { display: none; }
+			.allbtn { width: auto; padding: 0 11px; font-size: 10px; font-weight: 700; letter-spacing: .06em; }
+			.allbtn.sel { background: #111827; color: #fff; }
 
 			.hint {
 				position: absolute; z-index: 3; left: 50%; bottom: 12px; transform: translateX(-50%);
