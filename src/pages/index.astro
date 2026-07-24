@@ -126,7 +126,7 @@ const dataJson = JSON.stringify(bart);
 			const norm = (s) => s.toLowerCase().normalize('NFKD').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
 
 			// ---------- STATE ----------
-			let map, allBounds, viewBounds;
+			let map, allBounds, viewBounds, zoomCtl;
 			let current = null, drawnLL = [], drawing = false;
 			let revealed = false, scored = false, revealT = 0;
 			let lastScore = 0, lastDev = 0;
@@ -155,6 +155,16 @@ const dataJson = JSON.stringify(bart);
 				if (map && viewBounds) map.fitBounds(viewBounds, {
 					paddingTopLeft: [24, 30], paddingBottomRight: [24, 26], animate: !!animate,
 				});
+			}
+			// enable pan/zoom (and zoom buttons) only after drawing, so the map can be
+			// explored while naming stations; the drawing canvas lets clicks through then.
+			function setMapInteract(on) {
+				if (!map) return;
+				for (const f of ['dragging', 'scrollWheelZoom', 'doubleClickZoom', 'touchZoom', 'boxZoom'])
+					if (map[f]) on ? map[f].enable() : map[f].disable();
+				canvas.style.pointerEvents = on ? 'none' : 'auto';
+				if (on) { if (!zoomCtl) zoomCtl = L.control.zoom({ position: 'topleft' }); zoomCtl.addTo(map); }
+				else if (zoomCtl) zoomCtl.remove();
 			}
 			function zoomToLine() {
 				const b = L.latLngBounds([]);
@@ -428,6 +438,7 @@ const dataJson = JSON.stringify(bart);
 				revealed = false; scored = false; revealT = 0;
 				stActive = false; stState = []; particles = [];
 				viewBounds = allBounds;
+				setMapInteract(false);
 				els.menu.classList.add('gone'); els.hint.classList.remove('gone');
 				els.banner.classList.remove('show');
 				els.stationbar.classList.add('hidden');
@@ -494,6 +505,7 @@ const dataJson = JSON.stringify(bart);
 				els.stInput.value = ''; els.stInput.disabled = false;
 				els.giveupBtn.disabled = false;
 				fitCanvas();
+				setMapInteract(true);
 				setTimeout(() => els.stInput.focus(), 60);
 			}
 			function foundCount() { return stState.filter((s) => s.found).length; }
@@ -589,7 +601,7 @@ const dataJson = JSON.stringify(bart);
 			function reset() {
 				current = null; drawnLL = []; hairs = []; particles = [];
 				revealed = false; scored = false; revealT = 0; stActive = false; stState = [];
-				viewBounds = allBounds; refit(true);
+				viewBounds = allBounds; setMapInteract(false); refit(true);
 				els.menu.classList.remove('gone'); els.hint.classList.add('gone');
 				els.banner.classList.remove('show');
 				els.stationbar.classList.add('hidden');
