@@ -579,8 +579,10 @@ const dataJson = JSON.stringify(bart);
 			function hideAC() { els.acList.classList.add('hidden'); els.acList.innerHTML = ''; acCands = []; acSel = 0; }
 			function pick(name) { if (claim(name)) { els.stInput.value = ''; hideAC(); } else { els.stInput.select(); hideAC(); } }
 			function onInput() {
+				// only after 3+ chars, and only once it narrows to a single possible station
 				const v = els.stInput.value;
-				acCands = v.trim().length >= 4 ? candidates(v) : [];
+				const c = v.trim().length >= 3 ? candidates(v) : [];
+				acCands = c.length === 1 ? c : [];
 				acSel = 0; renderAC();
 			}
 			function onKey(e) {
